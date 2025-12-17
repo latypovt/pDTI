@@ -13,18 +13,23 @@ class AntsRegistration:
         self.transform_files = transform_files
         self.transform = None
 
-    def register(self, transform_type="QuickRigid", clean=False):
+    def register(self, transform_type="SyN", clean=False):
         if self.moving_image_path is None:
             raise ValueError("Moving image path must be provided for registration.")
 
         fixed_image = ants.image_read(self.fixed_image_path)
         moving_image = ants.image_read(self.moving_image_path)
 
+        params = {}
+        if transform_type == "SyN":
+            params['reg_iterations'] = (100, 50, 30)
+
         self.transform = ants.registration(
+            type_of_transform=transform_type,
             fixed=fixed_image,
             moving=moving_image,
-            type_of_transform=transform_type,
-            verbose=True
+            verbose=True,
+            **params
         )
 
         if clean or not self.output_prefix:
@@ -86,7 +91,7 @@ def main():
     parser.add_argument("--fixed_image", type=str, required=True, help="Fixed image")
     parser.add_argument("--moving_image", type=str, help="Moving image")
     parser.add_argument("--output_prefix", type=str, help="Prefix for registration outputs")
-    parser.add_argument("--transform_type", type=str, default="QuickRigid", help="ANTs transform type")
+    parser.add_argument("--transform_type", type=str, default="SyN", help="ANTs transform type")
 
     parser.add_argument("--transform_files", nargs="+",
                         help="Transform files for apply (order: warps then affine). If provided, skips needing registration.")

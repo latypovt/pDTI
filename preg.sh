@@ -13,9 +13,10 @@ Usage:
 Required:
   --bids_dataset PATH
   --subject ID
-  --atlas_fa PATH
+
 
 Optional:
+  --atlas_fa PATH                Atlas FA image (e.g., atlas/4wkAtlas/Pig_FA_Standard_4wk.nii)
   --session SES                    If omitted, processes all ses-* for subject
   --deriv_name NAME                Input derivative (default: pigdti)
   --out_deriv NAME                 Output derivative (default: atlas_space)
@@ -30,10 +31,11 @@ DERIV_NAME="pigdti"
 OUT_DERIV="atlas_space"
 PERMUTE_AXES="0,2,1"
 FLIP_AXES="2"
-TRANSFORM_TYPE="QuickRigid"
+TRANSFORM_TYPE="SyN"
 DRY_RUN=0
+ATLAS_FA="atlas/4wkAtlas/Pig_FA_Standard_4wk.nii"
 
-BIDS=""; SUB=""; SES=""; ATLAS_FA=""
+BIDS=""; SUB=""; SES=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -52,7 +54,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-[[ -n "$BIDS" && -n "$SUB" && -n "$ATLAS_FA" ]] || { usage; die "Missing required args"; }
+[[ -n "$BIDS" && -n "$SUB" ]] || { usage; die "Missing required args"; }
 [[ -d "$BIDS" ]] || die "No BIDS dir: $BIDS"
 [[ -f "$ATLAS_FA" ]] || die "No atlas FA: $ATLAS_FA"
 
@@ -173,6 +175,22 @@ for sesdir in "${SESSIONS[@]}"; do
       --moving_image \"$FA_REO\" \
       --output_prefix \"$OUT_PREFIX\" \
       --transform_type \"$TRANSFORM_TYPE\""
+  fi
+
+    # --- Rename FA warped output to BIDS-y "*_desc-FA_dwi.nii.gz"
+  FA_WARP_GZ="${OUT_PREFIX}_warped.nii.gz"
+  FA_WARP_NII="${OUT_PREFIX}_warped.nii"
+
+  if [[ -f "$FA_WARP_GZ" ]]; then
+    FA_OUT_BIDS="$OUT_DWI_DIR/sub-${SUB}_${sesdir}_space-Atlas_desc-FA_dwi.nii.gz"
+    log "Rename FA warped -> $FA_OUT_BIDS"
+    run "mv -f \"$FA_WARP_GZ\" \"$FA_OUT_BIDS\""
+  elif [[ -f "$FA_WARP_NII" ]]; then
+    FA_OUT_BIDS="$OUT_DWI_DIR/sub-${SUB}_${sesdir}_space-Atlas_desc-FA_dwi.nii"
+    log "Rename FA warped -> $FA_OUT_BIDS"
+    run "mv -f \"$FA_WARP_NII\" \"$FA_OUT_BIDS\""
+  else
+    log "WARN: FA warped output not found for prefix: $OUT_PREFIX (expected _warped.nii.gz)"
   fi
 
   # Rename applied outputs to space-Atlas (since we used apply_suffix "")
