@@ -102,7 +102,9 @@ log "permute_axes=$PERMUTE_AXES flip_axes=$FLIP_AXES"
 
 for sesdir in "${SESSIONS[@]}"; do
   log "---- Processing sub-${SUB}/${sesdir} ----"
-
+  
+  IN_ANAT_DIR="$BIDS/derivatives/${DERIV_NAME}/sub-${SUB}/${sesdir}/anat"
+  [[ -d "$IN_ANAT_DIR" ]] || { log "Skip: missing $IN_ANAT_DIR"; continue; }
   IN_DWI_DIR="$BIDS/derivatives/${DERIV_NAME}/sub-${SUB}/${sesdir}/dwi"
   [[ -d "$IN_DWI_DIR" ]] || { log "Skip: missing $IN_DWI_DIR"; continue; }
 
@@ -111,12 +113,14 @@ for sesdir in "${SESSIONS[@]}"; do
   MD_CAND=("$IN_DWI_DIR"/sub-"$SUB"_"$sesdir"_*desc-MD*_dwi.nii* "$IN_DWI_DIR"/sub-"$SUB"_"$sesdir"_*desc-MD*.nii*)
   AD_CAND=("$IN_DWI_DIR"/sub-"$SUB"_"$sesdir"_*desc-AD*_dwi.nii* "$IN_DWI_DIR"/sub-"$SUB"_"$sesdir"_*desc-AD*.nii*)
   RD_CAND=("$IN_DWI_DIR"/sub-"$SUB"_"$sesdir"_*desc-RD*_dwi.nii* "$IN_DWI_DIR"/sub-"$SUB"_"$sesdir"_*desc-RD*.nii*)
+  T1_CAND=("$IN_ANAT_DIR"/sub-"$SUB"_"$sesdir"_*T1w_brain.nii* )
   shopt -u nullglob
 
   FA="${FA_CAND[0]:-}"
   MD="${MD_CAND[0]:-}"
   AD="${AD_CAND[0]:-}"
   RD="${RD_CAND[0]:-}"
+  T1W="${T1_CAND[0]:-}"
 
   [[ -f "$FA" ]] || { log "Skip: FA not found"; continue; }
 
@@ -125,6 +129,7 @@ for sesdir in "${SESSIONS[@]}"; do
   MD_REO="$( [[ -f "${MD:-}" ]] && reoriented_path "$MD" || echo "" )"
   AD_REO="$( [[ -f "${AD:-}" ]] && reoriented_path "$AD" || echo "" )"
   RD_REO="$( [[ -f "${RD:-}" ]] && reoriented_path "$RD" || echo "" )"
+  T1W_REO="$( [[ -f "${T1W:-}" ]] && reoriented_path "$T1W" || echo "" )"
 
   if [[ ! -f "$FA_REO" ]]; then
     log "Reorient FA -> $FA_REO"
@@ -133,7 +138,7 @@ for sesdir in "${SESSIONS[@]}"; do
     log "FA already reoriented: $FA_REO"
   fi
 
-  for metric in MD AD RD; do
+  for metric in MD AD RD T1W; do
     src_var="${metric}"
     reo_var="${metric}_REO"
     src="${!src_var:-}"
@@ -149,15 +154,19 @@ for sesdir in "${SESSIONS[@]}"; do
 
   # Output derivatives/atlas_space
   OUT_DWI_DIR="$BIDS/derivatives/${OUT_DERIV}/sub-${SUB}/${sesdir}/dwi"
+  OUT_ANAT_DIR="$BIDS/derivatives/${OUT_DERIV}/sub-${SUB}/${sesdir}/anat"
   run "mkdir -p \"$OUT_DWI_DIR\""
+  run "mkdir -p \"$OUT_ANAT_DIR\""
 
   OUT_PREFIX="$OUT_DWI_DIR/sub-${SUB}_${sesdir}_space-Atlas_desc-FA"
+  OUT_ANAT_PREFIX="$OUT_ANAT_DIR/sub-${SUB}_${sesdir}_space-Atlas_desc-T1w"
 
   # Register on reoriented FA and apply transforms immediately to MD/AD/RD (also reoriented)
   APPLY_LIST=()
   [[ -f "${MD_REO:-}" ]] && APPLY_LIST+=("\"$MD_REO\"")
   [[ -f "${AD_REO:-}" ]] && APPLY_LIST+=("\"$AD_REO\"")
   [[ -f "${RD_REO:-}" ]] && APPLY_LIST+=("\"$RD_REO\"")
+  [[ -f "${T1W_REO:-}" ]] && APPLY_LIST+=("\"$T1W_REO\"")
 
   log "Register FA (reoriented) + apply to MD/AD/RD"
   if [[ "${#APPLY_LIST[@]}" -gt 0 ]]; then
@@ -177,6 +186,17 @@ for sesdir in "${SESSIONS[@]}"; do
       --transform_type \"$TRANSFORM_TYPE\""
   fi
 
+  #move T1w from dwi to anat output dir
+  if [[ -f "${T1W_REO:-}" ]]; then
+    T1W_OUT_REO="$OUT_DWI_DIR/$(basename "$T1W_REO")"
+    if [[ -f "$T1W_OUT_REO" ]]; then
+      T1W_OUT_BIDS="$OUT_ANAT_DIR/sub-${SUB}_${sesdir}_space-Atlas_desc-T1w.nii.gz"
+      log "Move T1w reoriented -> $T1W_OUT_BIDS"
+      run "mv -f \"$T1W_OUT_REO\" \"$T1W_OUT_BIDS\""
+    else
+      log "WARN: T1w reoriented output not found for prefix: $OUT_PREFIX"
+    fi
+  fi
     # --- Rename FA warped output to BIDS-y "*_desc-FA_dwi.nii.gz"
   FA_WARP_GZ="${OUT_PREFIX}_warped.nii.gz"
   FA_WARP_NII="${OUT_PREFIX}_warped.nii"
