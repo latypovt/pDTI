@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ------------------------------------------------------------
-# Pig DTI BIDS pipeline: Updated with JSON Readout & Mask Polishing
+# Pig DTI BIDS pipeline: Updated with T1-to-DWI Registration
 # ------------------------------------------------------------
 
 # --- MODULES ---
@@ -30,6 +30,11 @@ SUB_LABEL="sub-${SUB}"
 DERIV_ROOT="${BIDS_ROOT}/derivatives/${DERIV_NAME}"
 SESSIONS=($(ls -d ${BIDS_ROOT}/${SUB_LABEL}/ses-* 2>/dev/null | xargs -n1 basename | sed 's/ses-//'))
 [[ "${SES}" != "all" ]] && SESSIONS=("${SES}")
+
+# Locate helper scripts relative to this script's location
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ANTSREG_PY="${SCRIPT_DIR}/ANTsReg.py"
+PYTHON_VENV="/home/timurlatypov/.virtualenvs/tim_apple/bin/python"
 
 run_session() {
   local SES_LABEL="ses-$1"
@@ -75,11 +80,11 @@ run_session() {
   # 4) DUAL BRAIN MASKING & POLISHING
   local T1_MASK="${WORK}/4_T1_mask.nii.gz"
   local DWI_MASK="${WORK}/4_DWI_mask.nii.gz"
+  local B0_BRAIN="${WORK}/4_meanb0_brain.nii.gz"
   
   if [[ ! -f "${T1_MASK}" || ! -f "${DWI_MASK}" ]]; then
     echo "  [CHECKPOINT 4] Generating and Polishing Masks..."
     
-    # Initial Mask Generation
     bet4animal "${WORK}/3_T1_reo.nii.gz" "${WORK}/T1_brain_init.nii.gz" -m -z 7 -R
     mv "${WORK}/T1_brain_init_mask.nii.gz" "${T1_MASK}"
     
@@ -91,25 +96,23 @@ run_session() {
     itksnap -g "${WORK}/3_T1_reo.nii.gz" -s "${T1_MASK}"
     itksnap -g "${WORK}/3_meanb0_reo.nii.gz" -s "${DWI_MASK}"
     
-    # Polishing Step: Largest Connected Component + Edge Smoothing
     for MASK in "${T1_MASK}" "${DWI_MASK}"; do
-      echo "    Polishing ${MASK}..."
-      # 1. Keep only the largest connected component (removes isolated <10 voxel blobs)
       maskfilter "${MASK}" connect -largest "${WORK}/tmp_connected.nii.gz" -force
-      # 2. Smooth edges (Median filter to "polish" borders without losing volume)
       maskfilter "${WORK}/tmp_connected.nii.gz" median "${MASK}" -force
-      # 3. Final binary check and hole filling
       fslmaths "${MASK}" -fillh -bin "${MASK}"
     done
 
-    # Export to derivatives
+    # Save brain-masked B0 for Step 7 registration
+    fslmaths "${WORK}/3_meanb0_reo.nii.gz" -mas "${DWI_MASK}" "${B0_BRAIN}"
+
+    # Export anatomical derivatives
     cp "${WORK}/3_T1_reo.nii.gz" "${ANAT_DERIV}/${SUB_LABEL}_${SES_LABEL}_desc-preproc_T1w.nii.gz"
-    fslmaths "${ANAT_DERIV}/${SUB_LABEL}_${SES_LABEL}_desc-preproc_T1w.nii.gz" -mas "${T1_MASK}" "${ANAT_DERIV}/${SUB_LABEL}_${SES_LABEL}_desc-brain_T1w.nii.gz"
+    fslmaths "${WORK}/3_T1_reo.nii.gz" -mas "${T1_MASK}" "${ANAT_DERIV}/${SUB_LABEL}_${SES_LABEL}_desc-brain_T1w.nii.gz"
   fi
 
   # 5) DTI FITTING
   if [[ ! -f "${WORK}/5_dt.mif" ]]; then
-    echo "  [CHECKPOINT 5] Fitting tensors using manual polished DWI mask..."
+    echo "  [CHECKPOINT 5] Fitting tensors..."
     dwi2tensor "${WORK}/3_dwi_reo.mif" "${WORK}/5_dt.mif" -mask "${DWI_MASK}" -force
   fi
 
@@ -120,6 +123,27 @@ run_session() {
     -adc "${DWI_DERIV}/${SUB_LABEL}_${SES_LABEL}_desc-MD_dwi.nii.gz" \
     -ad "${DWI_DERIV}/${SUB_LABEL}_${SES_LABEL}_desc-AD_dwi.nii.gz" \
     -rd "${DWI_DERIV}/${SUB_LABEL}_${SES_LABEL}_desc-RD_dwi.nii.gz" -force
+
+# 7) REGISTER T1 TO DWI SPACE
+  if [[ ! -f "${ANAT_DERIV}/${SUB_LABEL}_${SES_LABEL}_space-dwi_desc-T1w.nii.gz" ]]; then
+    echo "  [CHECKPOINT 7] Registering T1_brain to Diffusion space..."
+    
+    # Define the skull-stripped T1 path
+    T1_BRAIN="${ANAT_DERIV}/${SUB_LABEL}_${SES_LABEL}_desc-brain_T1w.nii.gz"
+
+    # Use the explicit venv python path and the brain-masked T1
+    $PYTHON_VENV "${ANTSREG_PY}" \
+      --fixed_image "${B0_BRAIN}" \
+      --moving_image "${T1_BRAIN}" \
+      --transform_type "SyN" \
+      --output_prefix "${WORK}/7_t1_to_dwi" \
+      --apply_images "${T1_BRAIN}" \
+      --apply_out_dir "${WORK}" \
+      --apply_suffix "_space-dwi"
+
+    # Move and rename the warped brain-masked T1 to the BIDS anat folder
+    mv "${WORK}/$(basename "${T1_BRAIN}" .nii.gz)_space-dwi.nii.gz" "${ANAT_DERIV}/${SUB_LABEL}_${SES_LABEL}_space-dwi_desc-T1w.nii.gz"
+  fi
 
   echo "  [SUCCESS] Subject ${SUB_LABEL} sequence complete."
 }
