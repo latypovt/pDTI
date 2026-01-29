@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# ------------------------------------------------------------
+# Pig Atlas Registration Pipeline (Non-linear)
+# 1. T1_brain (subject) -> T1_template (atlas)
+# 2. FA (subject) -> FA_template (atlas) + apply to MD/AD/RD
+# ------------------------------------------------------------
+
 log(){ echo "[$(date +'%F %T')] $*"; }
 die(){ echo "ERROR: $*" >&2; exit 1; }
 need(){ command -v "$1" >/dev/null 2>&1 || die "Missing command: $1"; }
@@ -8,32 +14,28 @@ need(){ command -v "$1" >/dev/null 2>&1 || die "Missing command: $1"; }
 usage() {
   cat <<EOF
 Usage:
-  $(basename "$0") --bids_dataset PATH --subject ID --atlas_fa PATH [--session SES] [options]
+  $(basename "$0") --bids_dataset PATH --subject ID [options]
 
 Required:
-  --bids_dataset PATH
-  --subject ID
+  --bids_dataset PATH    Path to BIDS root
+  --subject ID           Subject ID (without sub-)
 
-
-Optional:
-  --atlas_fa PATH                Atlas FA image (e.g., atlas/4wkAtlas/Pig_FA_Standard_4wk.nii)
-  --session SES                    If omitted, processes all ses-* for subject
-  --deriv_name NAME                Input derivative (default: pigdti)
-  --out_deriv NAME                 Output derivative (default: atlas_space)
-  --permute_axes "0,2,1"           Default: 0,2,1
-  --flip_axes "2"                  Default: 2
-  --transform_type TYPE            Default: QuickRigid
-  --dry_run
+Options:
+  --session SES          Process specific session (default: all)
+  --deriv_name NAME      Input DTI derivative name (default: pdti2)
+  --out_deriv NAME       Output derivative name (default: atlasreg)
+  --atlas_dir PATH       Path to atlas folder (default: atlas/4wkAtlas)
+  --transform_type TYPE  ANTs registration type (default: SyN)
+  --python_venv PATH     Path to python executable with ANTs installed
 EOF
 }
 
-DERIV_NAME="pigdti"
-OUT_DERIV="atlas_space"
-PERMUTE_AXES="0,2,1"
-FLIP_AXES="2"
+# Default Paths
+DERIV_NAME="pdti2"
+OUT_DERIV="atlasreg"
 TRANSFORM_TYPE="SyN"
-DRY_RUN=0
-ATLAS_FA="atlas/4wkAtlas/Pig_FA_Standard_4wk.nii"
+ATLAS_DIR="atlas/4wkAtlas"
+PYTHON_VENV="/home/timurlatypov/.virtualenvs/tim_apple/bin/python" # User should override if venv is needed
 
 BIDS=""; SUB=""; SES=""
 
@@ -42,205 +44,104 @@ while [[ $# -gt 0 ]]; do
     --bids_dataset) BIDS="$2"; shift 2 ;;
     --subject) SUB="$2"; shift 2 ;;
     --session) SES="$2"; shift 2 ;;
-    --atlas_fa) ATLAS_FA="$2"; shift 2 ;;
     --deriv_name) DERIV_NAME="$2"; shift 2 ;;
     --out_deriv) OUT_DERIV="$2"; shift 2 ;;
-    --permute_axes) PERMUTE_AXES="$2"; shift 2 ;;
-    --flip_axes) FLIP_AXES="$2"; shift 2 ;;
+    --atlas_dir) ATLAS_DIR="$2"; shift 2 ;;
     --transform_type) TRANSFORM_TYPE="$2"; shift 2 ;;
-    --dry_run) DRY_RUN=1; shift ;;
-    -h|--help) usage; exit 0 ;;
+    --python_venv) PYTHON_VENV="$2"; shift 2 ;;
     *) die "Unknown arg: $1" ;;
   esac
 done
 
 [[ -n "$BIDS" && -n "$SUB" ]] || { usage; die "Missing required args"; }
-[[ -d "$BIDS" ]] || die "No BIDS dir: $BIDS"
-[[ -f "$ATLAS_FA" ]] || die "No atlas FA: $ATLAS_FA"
+
+# Define Templates
+T1_TEMPLATE="${ATLAS_DIR}/Pig_Brain_Atlas_4wk.nii"
+FA_TEMPLATE="${ATLAS_DIR}/Pig_FA_Standard_4wk.nii"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REORIENT_PY="$SCRIPT_DIR/reorient_image.py"
 ANTSREG_PY="$SCRIPT_DIR/ANTsReg.py"
-[[ -f "$REORIENT_PY" ]] || die "Missing $REORIENT_PY"
-[[ -f "$ANTSREG_PY" ]] || die "Missing $ANTSREG_PY"
-
-need python
-need antsApplyTransforms
-
-run() {
-  if [[ "$DRY_RUN" -eq 1 ]]; then
-    echo "[DRY_RUN] $*"
-  else
-    eval "$@"
-  fi
-}
-
-reoriented_path() {
-  local in="$1"
-  if [[ "$in" == *.nii.gz ]]; then
-    echo "${in%.nii.gz}_reoriented.nii.gz"
-  elif [[ "$in" == *.nii ]]; then
-    echo "${in%.nii}_reoriented.nii"
-  else
-    die "Unsupported NIfTI extension: $in"
-  fi
-}
 
 # Session discovery
 SUB_DIR="$BIDS/sub-${SUB}"
-[[ -d "$SUB_DIR" ]] || die "No subject dir: $SUB_DIR"
-
 if [[ -n "$SES" ]]; then
   SESSIONS=("ses-${SES}")
 else
   mapfile -t SESSIONS < <(find "$SUB_DIR" -maxdepth 1 -type d -name "ses-*" -printf "%f\n" | sort)
-  [[ "${#SESSIONS[@]}" -gt 0 ]] || die "No ses-* found for sub-${SUB}"
 fi
-
-log "sub-${SUB} sessions=${SESSIONS[*]}"
-log "permute_axes=$PERMUTE_AXES flip_axes=$FLIP_AXES"
 
 for sesdir in "${SESSIONS[@]}"; do
   log "---- Processing sub-${SUB}/${sesdir} ----"
   
+  # Input directories from pdti2
   IN_ANAT_DIR="$BIDS/derivatives/${DERIV_NAME}/sub-${SUB}/${sesdir}/anat"
-  [[ -d "$IN_ANAT_DIR" ]] || { log "Skip: missing $IN_ANAT_DIR"; continue; }
   IN_DWI_DIR="$BIDS/derivatives/${DERIV_NAME}/sub-${SUB}/${sesdir}/dwi"
-  [[ -d "$IN_DWI_DIR" ]] || { log "Skip: missing $IN_DWI_DIR"; continue; }
+  
+  # Output directories
+  WORK_DIR="$BIDS/derivatives/${OUT_DERIV}/sub-${SUB}/${sesdir}/work"
+  OUT_ANAT_DIR="$BIDS/derivatives/${OUT_DERIV}/sub-${SUB}/${sesdir}/anat"
+  OUT_DWI_DIR="$BIDS/derivatives/${OUT_DERIV}/sub-${SUB}/${sesdir}/dwi"
+  mkdir -p "$WORK_DIR" "$OUT_ANAT_DIR" "$OUT_DWI_DIR"
 
+  # Locate subject images
   shopt -s nullglob
-  FA_CAND=("$IN_DWI_DIR"/sub-"$SUB"_"$sesdir"_*desc-FA*_dwi.nii* "$IN_DWI_DIR"/sub-"$SUB"_"$sesdir"_*desc-FA*.nii*)
-  MD_CAND=("$IN_DWI_DIR"/sub-"$SUB"_"$sesdir"_*desc-MD*_dwi.nii* "$IN_DWI_DIR"/sub-"$SUB"_"$sesdir"_*desc-MD*.nii*)
-  AD_CAND=("$IN_DWI_DIR"/sub-"$SUB"_"$sesdir"_*desc-AD*_dwi.nii* "$IN_DWI_DIR"/sub-"$SUB"_"$sesdir"_*desc-AD*.nii*)
-  RD_CAND=("$IN_DWI_DIR"/sub-"$SUB"_"$sesdir"_*desc-RD*_dwi.nii* "$IN_DWI_DIR"/sub-"$SUB"_"$sesdir"_*desc-RD*.nii*)
-  T1_CAND=("$IN_ANAT_DIR"/sub-"$SUB"_"$sesdir"_*T1w_brain.nii* )
+  T1_BRAIN=("$IN_ANAT_DIR"/*_desc-brain_T1w.nii*)
+  FA=("$IN_DWI_DIR"/*_desc-FA_dwi.nii*)
+  MD=("$IN_DWI_DIR"/*_desc-MD_dwi.nii*)
+  AD=("$IN_DWI_DIR"/*_desc-AD_dwi.nii*)
+  RD=("$IN_DWI_DIR"/*_desc-RD_dwi.nii*)
   shopt -u nullglob
 
-  FA="${FA_CAND[0]:-}"
-  MD="${MD_CAND[0]:-}"
-  AD="${AD_CAND[0]:-}"
-  RD="${RD_CAND[0]:-}"
-  T1W="${T1_CAND[0]:-}"
-
-  [[ -f "$FA" ]] || { log "Skip: FA not found"; continue; }
-
-  # Reorient once (save into pigdti derivative with _reoriented suffix)
-  FA_REO="$(reoriented_path "$FA")"
-  MD_REO="$( [[ -f "${MD:-}" ]] && reoriented_path "$MD" || echo "" )"
-  AD_REO="$( [[ -f "${AD:-}" ]] && reoriented_path "$AD" || echo "" )"
-  RD_REO="$( [[ -f "${RD:-}" ]] && reoriented_path "$RD" || echo "" )"
-  T1W_REO="$( [[ -f "${T1W:-}" ]] && reoriented_path "$T1W" || echo "" )"
-
-  if [[ ! -f "$FA_REO" ]]; then
-    log "Reorient FA -> $FA_REO"
-    run "python \"$REORIENT_PY\" --in \"$FA\" --out \"$FA_REO\" --permute_axes \"$PERMUTE_AXES\" --flip_axes \"$FLIP_AXES\""
-  else
-    log "FA already reoriented: $FA_REO"
+  # --- 1. T1 Registration (Subject T1_brain -> Atlas T1) ---
+  if [[ -f "${T1_BRAIN[0]:-}" ]]; then
+    log "Registering T1_brain to Atlas..."
+    $PYTHON_VENV "$ANTSREG_PY" \
+      --fixed_image "$T1_TEMPLATE" \
+      --moving_image "${T1_BRAIN[0]}" \
+      --output_prefix "${WORK_DIR}/t1_to_atlas" \
+      --transform_type "$TRANSFORM_TYPE" \
+      --apply_out_dir "$OUT_ANAT_DIR" \
+      --apply_suffix "_space-Atlas" \
+      --apply_images "${T1_BRAIN[0]}"
+    
+    # BIDS Rename
+    mv "${OUT_ANAT_DIR}/$(basename "${T1_BRAIN[0]}" .nii.gz)_space-Atlas.nii.gz" \
+       "${OUT_ANAT_DIR}/sub-${SUB}_${sesdir}_space-Atlas_desc-brain_T1w.nii.gz"
   fi
 
-  for metric in MD AD RD T1W; do
-    src_var="${metric}"
-    reo_var="${metric}_REO"
-    src="${!src_var:-}"
-    reo="${!reo_var:-}"
-    [[ -n "$src" && -n "$reo" && -f "$src" ]] || { log "Skip $metric: missing"; continue; }
-    if [[ ! -f "$reo" ]]; then
-      log "Reorient $metric -> $reo"
-      run "python \"$REORIENT_PY\" --in \"$src\" --out \"$reo\" --permute_axes \"$PERMUTE_AXES\" --flip_axes \"$FLIP_AXES\""
-    else
-      log "$metric already reoriented: $reo"
-    fi
-  done
+  # --- 2. FA Registration (Subject FA -> Atlas FA) ---
+  if [[ -f "${FA[0]:-}" ]]; then
+    log "Registering FA to Atlas + applying to metrics..."
+    
+    # Prepare list of scalar images to transform
+    APPLY_LIST=()
+    [[ -f "${MD[0]:-}" ]] && APPLY_LIST+=("${MD[0]}")
+    [[ -f "${AD[0]:-}" ]] && APPLY_LIST+=("${AD[0]}")
+    [[ -f "${RD[0]:-}" ]] && APPLY_LIST+=("${RD[0]}")
 
-  # Output derivatives/atlas_space
-  OUT_DWI_DIR="$BIDS/derivatives/${OUT_DERIV}/sub-${SUB}/${sesdir}/dwi"
-  OUT_ANAT_DIR="$BIDS/derivatives/${OUT_DERIV}/sub-${SUB}/${sesdir}/anat"
-  run "mkdir -p \"$OUT_DWI_DIR\""
-  run "mkdir -p \"$OUT_ANAT_DIR\""
+    $PYTHON_VENV "$ANTSREG_PY" \
+      --fixed_image "$FA_TEMPLATE" \
+      --moving_image "${FA[0]}" \
+      --output_prefix "${WORK_DIR}/fa_to_atlas" \
+      --transform_type "$TRANSFORM_TYPE" \
+      --apply_out_dir "$OUT_DWI_DIR" \
+      --apply_suffix "_space-Atlas" \
+      --apply_images "${FA[0]}" "${APPLY_LIST[@]}"
 
-  OUT_PREFIX="$OUT_DWI_DIR/sub-${SUB}_${sesdir}_space-Atlas_desc-FA"
-  OUT_ANAT_PREFIX="$OUT_ANAT_DIR/sub-${SUB}_${sesdir}_space-Atlas_desc-T1w"
+    # BIDS Rename FA
+    mv "${OUT_DWI_DIR}/$(basename "${FA[0]}" .nii.gz)_space-Atlas.nii.gz" \
+       "${OUT_DWI_DIR}/sub-${SUB}_${sesdir}_space-Atlas_desc-FA_dwi.nii.gz"
 
-  # Register on reoriented FA and apply transforms immediately to MD/AD/RD (also reoriented)
-  APPLY_LIST=()
-  [[ -f "${MD_REO:-}" ]] && APPLY_LIST+=("\"$MD_REO\"")
-  [[ -f "${AD_REO:-}" ]] && APPLY_LIST+=("\"$AD_REO\"")
-  [[ -f "${RD_REO:-}" ]] && APPLY_LIST+=("\"$RD_REO\"")
-  [[ -f "${T1W_REO:-}" ]] && APPLY_LIST+=("\"$T1W_REO\"")
-
-  log "Register FA (reoriented) + apply to MD/AD/RD"
-  if [[ "${#APPLY_LIST[@]}" -gt 0 ]]; then
-    run "python \"$ANTSREG_PY\" \
-      --fixed_image \"$ATLAS_FA\" \
-      --moving_image \"$FA_REO\" \
-      --output_prefix \"$OUT_PREFIX\" \
-      --transform_type \"$TRANSFORM_TYPE\" \
-      --apply_out_dir \"$OUT_DWI_DIR\" \
-      --apply_suffix \"\" \
-      --apply_images ${APPLY_LIST[*]}"
-  else
-    run "python \"$ANTSREG_PY\" \
-      --fixed_image \"$ATLAS_FA\" \
-      --moving_image \"$FA_REO\" \
-      --output_prefix \"$OUT_PREFIX\" \
-      --transform_type \"$TRANSFORM_TYPE\""
+    # BIDS Rename Scalars
+    for metric_path in "${APPLY_LIST[@]}"; do
+      m_name=$(basename "$metric_path" .nii.gz)
+      metric_tag=$(echo "$m_name" | grep -oP "desc-\K[A-Z]{2}")
+      mv "${OUT_DWI_DIR}/${m_name}_space-Atlas.nii.gz" \
+         "${OUT_DWI_DIR}/sub-${SUB}_${sesdir}_space-Atlas_desc-${metric_tag}_dwi.nii.gz"
+    done
   fi
-
-  #move T1w from dwi to anat output dir
-  if [[ -f "${T1W_REO:-}" ]]; then
-    T1W_OUT_REO="$OUT_DWI_DIR/$(basename "$T1W_REO")"
-    if [[ -f "$T1W_OUT_REO" ]]; then
-      T1W_OUT_BIDS="$OUT_ANAT_DIR/sub-${SUB}_${sesdir}_space-Atlas_desc-T1w.nii.gz"
-      log "Move T1w reoriented -> $T1W_OUT_BIDS"
-      run "mv -f \"$T1W_OUT_REO\" \"$T1W_OUT_BIDS\""
-    else
-      log "WARN: T1w reoriented output not found for prefix: $OUT_PREFIX"
-    fi
-  fi
-    # --- Rename FA warped output to BIDS-y "*_desc-FA_dwi.nii.gz"
-  FA_WARP_GZ="${OUT_PREFIX}_warped.nii.gz"
-  FA_WARP_NII="${OUT_PREFIX}_warped.nii"
-
-  if [[ -f "$FA_WARP_GZ" ]]; then
-    FA_OUT_BIDS="$OUT_DWI_DIR/sub-${SUB}_${sesdir}_space-Atlas_desc-FA_dwi.nii.gz"
-    log "Rename FA warped -> $FA_OUT_BIDS"
-    run "mv -f \"$FA_WARP_GZ\" \"$FA_OUT_BIDS\""
-  elif [[ -f "$FA_WARP_NII" ]]; then
-    FA_OUT_BIDS="$OUT_DWI_DIR/sub-${SUB}_${sesdir}_space-Atlas_desc-FA_dwi.nii"
-    log "Rename FA warped -> $FA_OUT_BIDS"
-    run "mv -f \"$FA_WARP_NII\" \"$FA_OUT_BIDS\""
-  else
-    log "WARN: FA warped output not found for prefix: $OUT_PREFIX (expected _warped.nii.gz)"
-  fi
-
-  # Rename applied outputs to space-Atlas (since we used apply_suffix "")
-  # and keep the original metric naming; just add/replace space tag.
-  # (Minimal & safe: only rename files that were just created from *_reoriented.)
-  for src in "${MD_REO:-}" "${AD_REO:-}" "${RD_REO:-}"; do
-    [[ -f "$src" ]] || continue
-    b="$(basename "$src")"
-    # strip _reoriented
-    if [[ "$b" == *.nii.gz ]]; then
-      base="${b%.nii.gz}"
-      ext=".nii.gz"
-    else
-      base="${b%.nii}"
-      ext=".nii"
-    fi
-    base="${base%_reoriented}"
-    # enforce space-Atlas
-    if [[ "$base" == *"_space-"* ]]; then
-      outbase="$(echo "$base" | sed -E 's/_space-[^_]+/_space-Atlas/')"
-    else
-      outbase="${base}_space-Atlas"
-    fi
-    # applied file currently named after src (because suffix=""), so move it
-    cur="$OUT_DWI_DIR/$b"
-    [[ -f "$cur" ]] || continue
-    run "mv -f \"$cur\" \"$OUT_DWI_DIR/${outbase}${ext}\""
-  done
 
   log "Done sub-${SUB}/${sesdir}"
 done
 
-log "All done."
+log "Registration Pipeline Complete."
