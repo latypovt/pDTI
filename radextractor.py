@@ -69,7 +69,7 @@ def main(args):
     tpm_files = list(tpm_path.glob("*.nii*"))
     raw_tpms = {get_clean_name(f): nib.load(str(f)) for f in tpm_files}
     
-    deriv_dir = bids_root / "derivatives" / "atlas_space"
+    deriv_dir = bids_root / "derivatives" / "atlas_space-clean"
     subjects = [d for d in deriv_dir.iterdir() if d.is_dir() and d.name.startswith("sub-")]
 
     # Cache for resampled masks to avoid redundant work across sessions with the same grid

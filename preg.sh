@@ -2,14 +2,17 @@
 set -euo pipefail
 
 # ------------------------------------------------------------
-# Pig Atlas Registration Pipeline (Non-linear)
-# 1. T1_brain (subject) -> T1_template (atlas)
-# 2. FA (subject) -> FA_template (atlas) + apply to MD/AD/RD
+# Pig Atlas Registration Pipeline (Lesion-aware)
+# 1. Interactive lesion mask creation (ITK-SNAP)
+# 2. T1_brain (subject) -> T1_template (atlas)
+# 3. FA (subject) -> FA_template (atlas) + apply to MD/AD/RD
 # ------------------------------------------------------------
 
 log(){ echo "[$(date +'%F %T')] $*"; }
 die(){ echo "ERROR: $*" >&2; exit 1; }
 need(){ command -v "$1" >/dev/null 2>&1 || die "Missing command: $1"; }
+
+need itksnap
 
 usage() {
   cat <<EOF
@@ -30,12 +33,14 @@ Options:
 EOF
 }
 
-# Default Paths
-DERIV_NAME="pdti2"
+# ---------------- Defaults ----------------
+module load itksnap 2>/dev/null || true
+
+DERIV_NAME="pDTI-clean"
 OUT_DERIV="atlasreg"
 TRANSFORM_TYPE="SyN"
 ATLAS_DIR="atlas/4wkAtlas"
-PYTHON_VENV="/home/timurlatypov/.virtualenvs/tim_apple/bin/python" # User should override if venv is needed
+PYTHON_VENV="/home/timurlatypov/.virtualenvs/tim_apple/bin/python"
 
 BIDS=""; SUB=""; SES=""
 
@@ -55,15 +60,15 @@ done
 
 [[ -n "$BIDS" && -n "$SUB" ]] || { usage; die "Missing required args"; }
 
-# Define Templates
+# ---------------- Templates ----------------
 T1_TEMPLATE="${ATLAS_DIR}/Pig_Brain_Atlas_4wk.nii"
 FA_TEMPLATE="${ATLAS_DIR}/Pig_FA_Standard_4wk.nii"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ANTSREG_PY="$SCRIPT_DIR/ANTsReg.py"
 
-# Session discovery
-SUB_DIR="$BIDS/sub-${SUB}"
+# ---------------- Session discovery ----------------
+SUB_DIR="$BIDS/derivatives/${DERIV_NAME}/sub-${SUB}"
 if [[ -n "$SES" ]]; then
   SESSIONS=("ses-${SES}")
 else
@@ -72,16 +77,18 @@ fi
 
 for sesdir in "${SESSIONS[@]}"; do
   log "---- Processing sub-${SUB}/${sesdir} ----"
-  
-  # Input directories from pdti2
+
+  # Input directories
   IN_ANAT_DIR="$BIDS/derivatives/${DERIV_NAME}/sub-${SUB}/${sesdir}/anat"
   IN_DWI_DIR="$BIDS/derivatives/${DERIV_NAME}/sub-${SUB}/${sesdir}/dwi"
-  
+
   # Output directories
   WORK_DIR="$BIDS/derivatives/${OUT_DERIV}/sub-${SUB}/${sesdir}/work"
   OUT_ANAT_DIR="$BIDS/derivatives/${OUT_DERIV}/sub-${SUB}/${sesdir}/anat"
   OUT_DWI_DIR="$BIDS/derivatives/${OUT_DERIV}/sub-${SUB}/${sesdir}/dwi"
-  mkdir -p "$WORK_DIR" "$OUT_ANAT_DIR" "$OUT_DWI_DIR"
+  MASK_DIR="$BIDS/derivatives/${OUT_DERIV}/sub-${SUB}/${sesdir}/masks"
+
+  mkdir -p "$WORK_DIR" "$OUT_ANAT_DIR" "$OUT_DWI_DIR" "$MASK_DIR"
 
   # Locate subject images
   shopt -s nullglob
@@ -92,28 +99,112 @@ for sesdir in "${SESSIONS[@]}"; do
   RD=("$IN_DWI_DIR"/*_desc-RD_dwi.nii*)
   shopt -u nullglob
 
-  # --- 1. T1 Registration (Subject T1_brain -> Atlas T1) ---
+  LESION_MASK_T1="${MASK_DIR}/sub-${SUB}_${sesdir}_desc-lesion_maskT1.nii.gz"
+  RESAMPLED_MASK_T1="$MASK_DIR/sub-${SUB}_${sesdir}_desc-lesion_mask_resampledT1.nii.gz"
+
+  LESION_MASK_FA="${MASK_DIR}/sub-${SUB}_${sesdir}_desc-lesion_maskFA.nii.gz"
+  RESAMPLED_MASK_FA="$MASK_DIR/sub-${SUB}_${sesdir}_desc-lesion_mask_resampledFA.nii.gz"
+
+  # ------------------------------------------------------------
+  # Lesion-aware mask creation (interactive, non-optional)
+  # ------------------------------------------------------------
+
   if [[ -f "${T1_BRAIN[0]:-}" ]]; then
-    log "Registering T1_brain to Atlas..."
+    if [[ ! -f "$LESION_MASK_T1" ]]; then
+      log "No lesion mask found."
+      log "Launching ITK-SNAP for manual mask creation."
+      log "  Mask lesion / ventricles / pathology to EXCLUDE from registration"
+      log "  Save mask as: $LESION_MASK_T1"
+      fslmaths "${T1_BRAIN[0]}" -mul 0 "$LESION_MASK_T1"
+      fslcpgeom "${T1_BRAIN[0]}" "$LESION_MASK_T1"
+
+
+      itksnap \
+        -g "${T1_BRAIN[0]}" \
+        -s "$LESION_MASK_T1"
+
+      [[ -f "$LESION_MASK_T1" ]] || die "Lesion mask not created. Aborting."
+      log "Lesion mask saved: $LESION_MASK_T1"
+    else
+      log "Using existing lesion mask: $LESION_MASK_T1"
+    fi
+  fi
+
+  # Resample lesion mask to T1_brain space using nearest neighbor interpolation
+  log "Resampling lesion mask to match T1_brain..."
+  flirt -in "$LESION_MASK_T1" \
+        -ref "${T1_BRAIN[0]}" \
+        -applyxfm -interp nearestneighbour \
+        -out "$RESAMPLED_MASK_T1"
+
+  # Update mask variable for registration
+  log "Resampled mask saved: $RESAMPLED_MASK_T1"
+
+  # ------------------------------------------------------------
+  # 1. T1 Registration (lesion-aware)
+  # ------------------------------------------------------------
+  if [[ -f "${T1_BRAIN[0]:-}" ]]; then
+    log "Registering T1_brain to Atlas (lesion-aware)..."
+
     $PYTHON_VENV "$ANTSREG_PY" \
       --fixed_image "$T1_TEMPLATE" \
       --moving_image "${T1_BRAIN[0]}" \
+      --moving_mask "$RESAMPLED_MASK_T1" \
       --output_prefix "${WORK_DIR}/t1_to_atlas" \
       --transform_type "$TRANSFORM_TYPE" \
       --apply_out_dir "$OUT_ANAT_DIR" \
       --apply_suffix "_space-Atlas" \
       --apply_images "${T1_BRAIN[0]}"
-    
-    # BIDS Rename
+
     mv "${OUT_ANAT_DIR}/$(basename "${T1_BRAIN[0]}" .nii.gz)_space-Atlas.nii.gz" \
        "${OUT_ANAT_DIR}/sub-${SUB}_${sesdir}_space-Atlas_desc-brain_T1w.nii.gz"
   fi
 
-  # --- 2. FA Registration (Subject FA -> Atlas FA) ---
+  # ------------------------------------------------------------
+  # 2. FA Registration (reuse lesion mask)
+  # ------------------------------------------------------------
+
+  log "Resampling lesion mask to match T1_brain..."
+
+  flirt -in "$LESION_MASK_T1" \
+      -ref "${FA[0]}" \
+      -out "$RESAMPLED_MASK_FA" \
+      -interp nearestneighbour
+  
+
+  # if [[ -f "${FA[0]:-}" ]]; then
+  #   if [[ ! -f "$LESION_MASK_FA" ]]; then
+  #     log "No lesion mask found."
+  #     log "Launching ITK-SNAP for manual mask creation."
+  #     log "  Mask lesion / ventricles / pathology to EXCLUDE from registration"
+  #     log "  Save mask as: $LESION_MASK_FA"
+  #     fslmaths "${FA[0]}" -mul 0 "$LESION_MASK_FA"
+  #     fslcpgeom "${FA[0]}" "$LESION_MASK_FA"
+
+
+  #     itksnap \
+  #       -g "${FA[0]}" \
+  #       -s "$LESION_MASK_FA"
+
+  #     [[ -f "$LESION_MASK_FA" ]] || die "Lesion mask not created. Aborting."
+  #     log "Lesion mask saved: $LESION_MASK_FA"
+  #   else
+  #     log "Using existing lesion mask: $LESION_MASK_FA"
+  #   fi
+  # fi
+
   if [[ -f "${FA[0]:-}" ]]; then
-    log "Registering FA to Atlas + applying to metrics..."
-    
-    # Prepare list of scalar images to transform
+    log "Registering FA to Atlas + applying to scalars (lesion-aware)..."
+
+      # Resample lesion mask to T1_brain space using nearest neighbor interpolation
+    # log "Resampling lesion mask to match T1_brain..."
+    # flirt -in "$LESION_MASK_FA" \
+    #       -ref "${FA[0]}" \
+    #       -applyxfm -interp nearestneighbour \
+    #       -out "$RESAMPLED_MASK_FA"
+
+    log "Resampled mask saved: $RESAMPLED_MASK_FA"
+
     APPLY_LIST=()
     [[ -f "${MD[0]:-}" ]] && APPLY_LIST+=("${MD[0]}")
     [[ -f "${AD[0]:-}" ]] && APPLY_LIST+=("${AD[0]}")
@@ -122,17 +213,16 @@ for sesdir in "${SESSIONS[@]}"; do
     $PYTHON_VENV "$ANTSREG_PY" \
       --fixed_image "$FA_TEMPLATE" \
       --moving_image "${FA[0]}" \
+      --moving_mask "$RESAMPLED_MASK_FA" \
       --output_prefix "${WORK_DIR}/fa_to_atlas" \
       --transform_type "$TRANSFORM_TYPE" \
       --apply_out_dir "$OUT_DWI_DIR" \
       --apply_suffix "_space-Atlas" \
       --apply_images "${FA[0]}" "${APPLY_LIST[@]}"
 
-    # BIDS Rename FA
     mv "${OUT_DWI_DIR}/$(basename "${FA[0]}" .nii.gz)_space-Atlas.nii.gz" \
        "${OUT_DWI_DIR}/sub-${SUB}_${sesdir}_space-Atlas_desc-FA_dwi.nii.gz"
 
-    # BIDS Rename Scalars
     for metric_path in "${APPLY_LIST[@]}"; do
       m_name=$(basename "$metric_path" .nii.gz)
       metric_tag=$(echo "$m_name" | grep -oP "desc-\K[A-Z]{2}")
